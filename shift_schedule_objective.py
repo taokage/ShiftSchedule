@@ -1067,7 +1067,7 @@ def set_objective(
 
         total_day_work_count = model.NewIntVar(
             0,
-            IW1_DAY_COUNT_MAX,
+            NUM_DAYS * 2,
             f"total_day_work_count_s{staff}"
         )
 
@@ -1086,9 +1086,12 @@ def set_objective(
             f"iw1_day_shortage_from_20_s{staff}"
         )
 
-        model.Add(
-            shortage_from_20
-            == IW1_DAY_COUNT_MAX - total_day_work_count
+        model.AddMaxEquality(
+            shortage_from_20,
+            [
+                IW1_DAY_COUNT_MAX - total_day_work_count,
+                0,
+            ]
         )
 
         capped_shortage = model.NewIntVar(
