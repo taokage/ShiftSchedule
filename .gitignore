@@ -22,3 +22,6 @@ dist/
 *.log
 
 release/
+
+# アーカイブ作成ファイル
+create_archive.py

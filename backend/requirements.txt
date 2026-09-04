@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+ortools
+openpyxl
+numpy
+python-multipart

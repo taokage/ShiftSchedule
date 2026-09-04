@@ -1,0 +1,10 @@
+.venv
+.git
+.idea
+__pycache__
+*.pyc
+.DS_Store
+build
+dist
+release
+*.spec

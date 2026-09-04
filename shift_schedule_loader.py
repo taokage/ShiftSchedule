@@ -1,6 +1,5 @@
 import numpy as np
 from openpyxl import load_workbook
-from tkinter import Tk, filedialog
 
 
 NUM_DAYS = 31
@@ -9,6 +8,10 @@ NUM_SHIFTS = 2
 
 
 def select_excel_file():
+    # tkinter はDockerのWeb APIでは使用しないため、デスクトップ実行時だけ
+    # 読み込む。python:slim イメージには通常tkinterが含まれていない。
+    from tkinter import Tk, filedialog
+
     root = Tk()
     root.withdraw()
 
@@ -25,14 +28,15 @@ def select_excel_file():
     return file_path
 
 
-def load_shift_schedule_excel():
-    file_path = select_excel_file()
+def load_shift_schedule_excel(file_path=None, debug=False):
+    """パスまたはファイルオブジェクトから勤務条件を読み込む。"""
+    if file_path is None:
+        file_path = select_excel_file()
     wb = load_workbook(file_path, data_only=True, read_only=True)
 
-    print("読み込んだファイル:", file_path)
-    print("シート一覧:")
-    for s in wb.sheetnames:
-        print(repr(s))
+    if debug:
+        print("読み込んだファイル:", file_path)
+        print("シート一覧:", wb.sheetnames)
 
     unavailable_3d = np.zeros((NUM_STAFF, NUM_DAYS, NUM_SHIFTS), dtype=bool)
     avoid_3d = np.zeros((NUM_STAFF, NUM_DAYS, NUM_SHIFTS), dtype=bool)
@@ -184,7 +188,8 @@ def load_shift_schedule_excel():
     else:
         print("night_pair_ng シートがありません。night_pair_ng_2d は全てFalseです。")
 
-    debug_print_loaded_data(
+    if debug:
+        debug_print_loaded_data(
         unavailable_3d,
         avoid_3d,
         mandatory_3d,
@@ -202,7 +207,7 @@ def load_shift_schedule_excel():
         iw1_priority_1d,
         day_week_2d,
         night_pair_ng_2d,
-    )
+        )
 
     return (
         unavailable_3d,

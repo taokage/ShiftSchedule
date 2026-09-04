@@ -1,0 +1,4 @@
+ortools
+openpyxl
+fastapi
+uvicorn[standard]
