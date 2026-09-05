@@ -1,7 +1,8 @@
 from io import BytesIO
 from pathlib import Path
 from zipfile import BadZipFile
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+import os
 
 import numpy as np
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
@@ -9,11 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.datavalidation import DataValidation
 from ortools.sat.python import cp_model
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import JSON, DateTime, String, create_engine, select, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from shift_schedule_exporter import export_final_work_3d
 from shift_schedule_loader import load_shift_schedule_excel
@@ -40,17 +44,19 @@ LABEL_TO_REQUEST = {label: value for value, label in REQUEST_CHOICES}
 class StaffInput(BaseModel):
     no: int = 0
     name: str = ""
+    emergency_count: int = Field(0, ge=0, le=1)
     leader_level: int = Field(0, ge=0, le=2)
     # EW1/IW1 は現行solverに接続。EW2/IW2 は管理情報として保持し、
     # 将来solverを拡張するときにそのまま利用できるようAPIでも受け取る。
     ew1_candidate: bool = False
-    ew1_available: bool = False
-    ew2_available: bool = False
-    iw1_priority: int = Field(0, ge=0, le=3)
-    iw1_available: bool = False
-    iw2_available: bool = False
-    target_day: int = Field(0, ge=0, le=31)
-    target_night: int = Field(0, ge=0, le=31)
+    ew1_available: int = Field(0, ge=0, le=1)
+    ew2_available: int = Field(0, ge=0, le=1)
+    ew3_available: int = Field(0, ge=0, le=1)
+    # IW1は0=対象外、1〜3=優先度を兼ねた整数値として扱う。
+    iw1_available: int = Field(0, ge=0, le=3)
+    iw2_available: int = Field(0, ge=0, le=1)
+    target_day: int = Field(0, ge=0, le=20)
+    target_night: int = Field(0, ge=0, le=10)
 
 class ScheduleInput(BaseModel):
     dates: list[str]
@@ -74,6 +80,7 @@ class RequestExcelInput(BaseModel):
     staff: list[StaffInput]
     requests: list[list[list[str]]]
     remarks: list[list[list[str]]]
+    coverage: list[list[dict[str, int]]] = []
     holiday_labels: list[str] = []
 
     @field_validator("dates")
@@ -83,14 +90,87 @@ class RequestExcelInput(BaseModel):
             raise ValueError("日付は31日分必要です。")
         return value
 
-app = FastAPI(title="Shift Schedule API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://shift_user:shift_password@db:5432/shift_schedule",
+)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class AppState(Base):
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[dict | list] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class StatePayload(BaseModel):
+    value: dict | list
+
+
+app = FastAPI(title="Shift Schedule API", version="3.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def create_database_tables():
+    Base.metadata.create_all(bind=engine)
+
 
 @app.get("/")
-def root(): return {"message": "Shift Schedule Backend", "status": "running"}
+def root():
+    return {"message": "Shift Schedule Backend", "status": "running", "database": "postgresql"}
+
 
 @app.get("/health")
-def health(): return {"status": "ok"}
+def health():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "ok"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
+
+
+@app.get("/state/{key}")
+def get_state(key: str):
+    with SessionLocal() as session:
+        row = session.get(AppState, key)
+        if row is None:
+            raise HTTPException(status_code=404, detail="state not found")
+        return {"key": row.key, "value": row.value, "updated_at": row.updated_at}
+
+
+@app.put("/state/{key}")
+def put_state(key: str, payload: StatePayload):
+    with SessionLocal() as session:
+        row = session.get(AppState, key)
+        if row is None:
+            row = AppState(key=key, value=payload.value)
+            session.add(row)
+        else:
+            row.value = payload.value
+            row.updated_at = datetime.now(timezone.utc)
+        session.commit()
+        return {"saved": True, "key": key}
 
 def arrays_from_payload(payload):
     unavailable = np.ones((N_STAFF, N_DAYS, N_SHIFTS), dtype=bool)
@@ -104,7 +184,8 @@ def arrays_from_payload(payload):
         staffno[s] = member.no or s + 1; staffname[s] = member.name.strip()
         leader[s] = member.leader_level
         ew1_candidate[s] = bool(member.ew1_available or member.ew1_candidate)
-        iw1_priority[s] = member.iw1_priority if member.iw1_available else 0
+        # IW1の0〜3をそのままsolver内部の優先度配列へ渡す。
+        iw1_priority[s] = int(member.iw1_available)
         optimal[s] = [member.target_day, member.target_night]
         if member.name.strip():
             unavailable[s, :, :] = False
@@ -155,6 +236,7 @@ def _request_excel_workbook(payload: RequestExcelInput):
     holiday_fill = PatternFill("solid", fgColor="FFF1F1")
     remark_fill = PatternFill("solid", fgColor="FAFAFA")
     locked_fill = PatternFill("solid", fgColor="F1F3F5")
+    pink_fill = PatternFill("solid", fgColor="FCE4EC")
 
     ws["A1"] = "勤務者ID"
     ws["A2"] = "勤務者名"
@@ -186,6 +268,13 @@ def _request_excel_workbook(payload: RequestExcelInput):
             ws.cell(3, c).border = border
             ws.cell(3, c).font = Font(bold=True)
             ws.cell(3, c).alignment = Alignment(horizontal="center", vertical="center")
+
+        # 勤務者名が入力されている場合は、氏名セルを薄いピンクにする。
+        name_coord = ws.cell(2, col).coordinate
+        ws.conditional_formatting.add(
+            f"{name_coord}:{ws.cell(2, col + 1).coordinate}",
+            FormulaRule(formula=[f'LEN({name_coord})>0'], fill=pink_fill),
+        )
 
     dropdown = DataValidation(
         type="list",
@@ -245,13 +334,181 @@ def _request_excel_workbook(payload: RequestExcelInput):
                 dropdown.add(ws.cell(request_row, col))
 
     # --------------------------------------------------
+    # BM列以降：日別の管理者設定
+    # BM:BN 最小勤務数 / BO:BP 最小リーダー数
+    # BQ:BR EW1 / BS:BT EW2 / BU:BV EW3 / BW:BX IW1 / BY:BZ IW2
+    # --------------------------------------------------
+    coverage_sections = [
+        (65, "最小勤務数", "minimum"),
+        (67, "最小リーダー数", "leaders"),
+        (69, "ew1 (西大寺勤務）", "ew1"),
+        (71, "ew2 (薬師寺勤務)", "ew2"),
+        (73, "ew3(吉備勤務)", "ew3"),
+        (75, "IW1(クリクラ）", "iw1"),
+        (77, "IW2(未設定)", "iw2"),
+    ]
+    for start_col, label, _ in coverage_sections:
+        ws.merge_cells(start_row=2, start_column=start_col, end_row=2, end_column=start_col + 1)
+        ws.cell(2, start_col, label)
+        ws.cell(3, start_col, "日勤")
+        ws.cell(3, start_col + 1, "夜勤")
+        for row in (2, 3):
+            for c in (start_col, start_col + 1):
+                ws.cell(row, c).fill = header_fill if row == 2 else sub_fill
+                ws.cell(row, c).border = border
+                ws.cell(row, c).font = Font(bold=True)
+                ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    min_day_validation = DataValidation(type="list", formula1='"0,1,2,3,4,5,6,7,8,9,10"', allow_blank=False)
+    min_night_validation = DataValidation(type="list", formula1='"0,1,2,3,4,5"', allow_blank=False)
+    leader_day_validation = DataValidation(type="list", formula1='"0,1,2,3"', allow_blank=False)
+    leader_night_validation = DataValidation(type="list", formula1='"0,1,2"', allow_blank=False)
+    zero_one_day_validation = DataValidation(type="list", formula1='"0,1"', allow_blank=False)
+    zero_one_night_validation = DataValidation(type="list", formula1='"0,1"', allow_blank=False)
+    for dv in (
+        min_day_validation,
+        min_night_validation,
+        leader_day_validation,
+        leader_night_validation,
+        zero_one_day_validation,
+        zero_one_night_validation,
+    ):
+        ws.add_data_validation(dv)
+
+    for d in range(N_DAYS):
+        request_row = 4 + d * 2
+        defaults = [
+            {"minimum": 3, "leaders": 1, "ew1": 0, "ew2": 0, "ew3": 0, "iw1": 0, "iw2": 0},
+            {"minimum": 2, "leaders": 1, "ew1": 0, "ew2": 0, "ew3": 0, "iw1": 0, "iw2": 0},
+        ]
+        day_coverage = payload.coverage[d] if d < len(payload.coverage) else defaults
+        for sh in range(N_SHIFTS):
+            values = day_coverage[sh] if sh < len(day_coverage) else defaults[sh]
+            for start_col, _, key in coverage_sections:
+                cell = ws.cell(request_row, start_col + sh)
+                cell.value = int(values.get(key, defaults[sh][key]))
+                cell.border = border
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.fill = holiday_fill if (
+                    d < len(payload.holiday_labels) and payload.holiday_labels[d] == "休日"
+                ) else PatternFill(fill_type=None)
+
+        min_day_validation.add(ws.cell(request_row, 65))
+        min_night_validation.add(ws.cell(request_row, 66))
+        leader_day_validation.add(ws.cell(request_row, 67))
+        leader_night_validation.add(ws.cell(request_row, 68))
+        for start_col in (69, 71, 73, 75, 77):
+            zero_one_day_validation.add(ws.cell(request_row, start_col))
+            zero_one_night_validation.add(ws.cell(request_row, start_col + 1))
+
+        # 数値ドロップダウンで1以上なら薄いピンク。
+        for col in range(65, 79):
+            ws.conditional_formatting.add(
+                ws.cell(request_row, col).coordinate,
+                CellIsRule(operator="greaterThanOrEqual", formula=["1"], fill=pink_fill),
+            )
+
+        remark_row = request_row + 1
+        for col in range(65, 79):
+            ws.cell(remark_row, col).border = border
+            ws.cell(remark_row, col).fill = remark_fill
+
+    # --------------------------------------------------
+    # 管理者設定入力欄（添付Excelの下段レイアウトに合わせる）
+    # 66:救急医師カウント / 67:リーダーlevel / 68:適切なシフト数
+    # 69-73: EW1 / EW2 / EW3 / IW1 / IW2
+    # --------------------------------------------------
+    admin_rows = [
+        (66, "救急医師カウント"),
+        (67, "リーダーlevel"),
+        (68, "適切なシフト数"),
+        (69, "ew1 (西大寺勤務）"),
+        (70, "ew2 (薬師寺勤務)"),
+        (71, "ew3 (吉備勤務）"),
+        (72, "iw1 (クリクラ）"),
+        (73, "iw2 (未設定）"),
+    ]
+    for row, label in admin_rows:
+        ws.cell(row, 1, label)
+        for col in range(1, 5):
+            ws.cell(row, col).fill = header_fill
+            ws.cell(row, col).border = border
+            ws.cell(row, col).font = Font(bold=True)
+            ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center")
+
+    for i in range(N_STAFF):
+        col = 5 + i * 2
+        member = payload.staff[i] if i < len(payload.staff) else StaffInput(no=i)
+        # 救急医師カウントは管理画面の整数0/1をそのまま出力する。
+        ws.cell(66, col, int(member.emergency_count))
+        ws.cell(67, col, int(member.leader_level))
+        # 適切な勤務数は日勤・夜勤の2セルを使用。
+        ws.cell(68, col, int(member.target_day))
+        ws.cell(68, col + 1, int(member.target_night))
+        # EW1/EW2/EW3/IW2は0/1、IW1は0〜3。
+        ws.cell(69, col, 1 if member.ew1_available else 0)
+        ws.cell(70, col, 1 if member.ew2_available else 0)
+        ws.cell(71, col, 1 if member.ew3_available else 0)
+        ws.cell(72, col, int(member.iw1_available))
+        ws.cell(73, col, 1 if member.iw2_available else 0)
+
+        for row in range(66, 74):
+            for c in (col, col + 1):
+                ws.cell(row, c).border = border
+                ws.cell(row, c).alignment = Alignment(horizontal="center", vertical="center")
+                ws.cell(row, c).fill = sub_fill
+
+    # Excel上で誤入力を防ぐため、可否・レベル・適切なシフト数に入力規則を設定。
+    binary_validation = DataValidation(type="list", formula1='"0,1"', allow_blank=False)
+    binary_validation.error = "0 または 1 を入力してください。"
+    ws.add_data_validation(binary_validation)
+    leader_validation = DataValidation(type="list", formula1='"0,1,2"', allow_blank=False)
+    ws.add_data_validation(leader_validation)
+    iw1_validation = DataValidation(type="list", formula1='"0,1,2,3"', allow_blank=False)
+    iw1_validation.error = "0〜3から選択してください。"
+    ws.add_data_validation(iw1_validation)
+    target_day_validation = DataValidation(
+        type="list",
+        formula1='"0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"',
+        allow_blank=False,
+    )
+    target_night_validation = DataValidation(
+        type="list",
+        formula1='"0,1,2,3,4,5,6,7,8,9,10"',
+        allow_blank=False,
+    )
+    ws.add_data_validation(target_day_validation)
+    ws.add_data_validation(target_night_validation)
+    for i in range(N_STAFF):
+        col = 5 + i * 2
+        binary_validation.add(ws.cell(66, col))
+        leader_validation.add(ws.cell(67, col))
+        target_day_validation.add(ws.cell(68, col))
+        target_night_validation.add(ws.cell(68, col + 1))
+        for row in (69, 70, 71, 73):
+            binary_validation.add(ws.cell(row, col))
+        iw1_validation.add(ws.cell(72, col))
+
+        # 整数ドロップダウンで1以上なら薄いピンク。
+        for row, c in ((66, col), (67, col), (68, col), (68, col + 1), (69, col), (70, col), (71, col), (72, col), (73, col)):
+            ws.conditional_formatting.add(
+                ws.cell(row, c).coordinate,
+                CellIsRule(operator="greaterThanOrEqual", formula=["1"], fill=pink_fill),
+            )
+
+    # 左端の長い見出しを読みやすくするため、A:D を結合。
+    for row in (1, 2, 3, 66, 67, 68, 69, 70, 71, 72, 73):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # --------------------------------------------------
     # 勤務者ごとの境界線を太くする
     # 各勤務者は「日勤・夜勤」の2列なので、夜勤列の右端を太線にする
     # --------------------------------------------------
     for i in range(N_STAFF):
         night_col = 5 + i * 2 + 1
 
-        for row in range(1, 66):
+        for row in range(1, 74):
             cell = ws.cell(row=row, column=night_col)
 
             cell.border = Border(
@@ -268,7 +525,9 @@ def _request_excel_workbook(payload: RequestExcelInput):
     ws.column_dimensions["D"].width = 10
     for col in range(5, 5 + N_STAFF * 2):
         ws.column_dimensions[get_column_letter(col)].width = 13
-    for row in range(1, 66):
+    for col in range(65, 79):
+        ws.column_dimensions[get_column_letter(col)].width = 12
+    for row in range(1, 74):
         ws.row_dimensions[row].height = 22
     ws.row_dimensions[1].height = 24
     ws.row_dimensions[2].height = 26
@@ -334,11 +593,97 @@ def _parse_request_excel(content: bytes):
                 requests[i][d][sh] = LABEL_TO_REQUEST[raw_choice]
                 remarks[i][d][sh] = str(ws.cell(remark_row, col).value or "")
 
+    def _int_cell(row: int, col: int, default: int = 0) -> int:
+        raw = ws.cell(row, col).value
+        if raw in (None, ""):
+            return default
+        if isinstance(raw, bool):
+            return 1 if raw else 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{ws.cell(row, col).coordinate} は整数で入力してください。") from exc
+
+    # BM:BZ の日別管理者設定を読み込む。
+    coverage = []
+    coverage_col_map = {
+        "minimum": 65,
+        "leaders": 67,
+        "ew1": 69,
+        "ew2": 71,
+        "ew3": 73,
+        "iw1": 75,
+        "iw2": 77,
+    }
+    for d in range(N_DAYS):
+        row = 4 + d * 2
+        shifts = []
+        for sh in range(N_SHIFTS):
+            item = {key: _int_cell(row, col + sh, 0) for key, col in coverage_col_map.items()}
+            if sh == 0:
+                if not 0 <= item["minimum"] <= 10:
+                    raise HTTPException(400, f"{ws.cell(row, 65).coordinate} の最小勤務数（日勤）は0〜10で選択してください。")
+                if not 0 <= item["leaders"] <= 3:
+                    raise HTTPException(400, f"{ws.cell(row, 67).coordinate} の最小リーダー数（日勤）は0〜3で選択してください。")
+            else:
+                if not 0 <= item["minimum"] <= 5:
+                    raise HTTPException(400, f"{ws.cell(row, 66).coordinate} の最小勤務数（夜勤）は0〜5で選択してください。")
+                if not 0 <= item["leaders"] <= 2:
+                    raise HTTPException(400, f"{ws.cell(row, 68).coordinate} の最小リーダー数（夜勤）は0〜2で選択してください。")
+            for key in ("ew1", "ew2", "ew3", "iw1", "iw2"):
+                if item[key] not in (0, 1):
+                    coord = ws.cell(row, coverage_col_map[key] + sh).coordinate
+                    raise HTTPException(400, f"{coord} の {key.upper()} は0または1で選択してください。")
+            shifts.append(item)
+        coverage.append(shifts)
+
+    staff = []
+    for i in range(N_STAFF):
+        col = 5 + i * 2
+        emergency_count = _int_cell(66, col, 0)
+        leader_level = _int_cell(67, col, 0)
+        target_day = _int_cell(68, col, 0)
+        target_night = _int_cell(68, col + 1, 0)
+        ew1_available = _int_cell(69, col, 0)
+        ew2_available = _int_cell(70, col, 0)
+        ew3_available = _int_cell(71, col, 0)
+        iw1_available = _int_cell(72, col, 0)
+        iw2_available = _int_cell(73, col, 0)
+
+        if emergency_count not in (0, 1):
+            raise HTTPException(400, f"{ws.cell(66, col).coordinate} の救急医師カウントは0または1で入力してください。")
+        if leader_level not in (0, 1, 2):
+            raise HTTPException(400, f"{ws.cell(67, col).coordinate} のリーダーlevelは0〜2で入力してください。")
+        if not 0 <= target_day <= 20:
+            raise HTTPException(400, f"{ws.cell(68, col).coordinate} の適切なシフト数（日勤）は0〜20で選択してください。")
+        if not 0 <= target_night <= 10:
+            raise HTTPException(400, f"{ws.cell(68, col + 1).coordinate} の適切なシフト数（夜勤）は0〜10で選択してください。")
+        for row, value in ((69, ew1_available), (70, ew2_available), (71, ew3_available), (72, iw1_available), (73, iw2_available)):
+            if value not in (0, 1):
+                raise HTTPException(400, f"{ws.cell(row, col).coordinate} は0または1で入力してください。")
+
+        staff.append({
+            "no": i,
+            "name": staff_names[i],
+            "emergency_count": emergency_count,
+            "leader_level": leader_level,
+            "ew1_candidate": bool(ew1_available),
+            "ew1_available": int(ew1_available),
+            "ew2_available": int(ew2_available),
+            "ew3_available": int(ew3_available),
+            "iw1_available": int(iw1_available),
+            "iw2_available": int(iw2_available),
+            "target_day": target_day,
+            "target_night": target_night,
+        })
+
     return {
         "dates": dates,
         "staff_names": staff_names,
+        "staff": staff,
         "requests": requests,
         "remarks": remarks,
+        "coverage": coverage,
     }
 
 

@@ -1,22 +1,40 @@
 services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: shift_schedule
+      POSTGRES_USER: shift_user
+      POSTGRES_PASSWORD: shift_password
+    volumes:
+      - shift_schedule_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shift_user -d shift_schedule"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: shift-schedule-backend
     ports:
       - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://shift_user:shift_password@db:5432/shift_schedule
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 3s
-      retries: 5
+      retries: 10
 
   frontend:
     build:
       context: ./frontend
-    container_name: shift-schedule-frontend
     ports:
       - "5173:5173"
     environment:
@@ -24,3 +42,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  shift_schedule_db_data:
