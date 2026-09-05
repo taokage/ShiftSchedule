@@ -25,3 +25,4 @@ release/
 
 # アーカイブ作成ファイル
 create_archive.py
+replace_from_archive.py
