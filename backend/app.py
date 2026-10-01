@@ -1,11 +1,12 @@
 from io import BytesIO
 from pathlib import Path
+import json
 from zipfile import BadZipFile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 
 import numpy as np
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
@@ -16,19 +17,37 @@ from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.datavalidation import DataValidation
 from ortools.sat.python import cp_model
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import JSON, DateTime, String, create_engine, select, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 from shift_schedule_exporter import export_final_work_3d
 from shift_schedule_loader import load_shift_schedule_excel
 from shift_schedule_solver import solve_shift_schedule
+from database import (
+    Base,
+    StaffProfile,
+    cycle_statuses as db_cycle_statuses,
+    delete_cycle as db_delete_cycle,
+    delete_profile as db_delete_profile,
+    get_setting as db_get_setting,
+    list_profiles as db_list_profiles,
+    load_cycle as db_load_cycle,
+    migrate_legacy_app_state,
+    migrate_legacy_final_decisions,
+    migrate_night_pair_ng_to_staff_code,
+    upgrade_app_settings_schema,
+    upgrade_relational_schema,
+    put_setting as db_put_setting,
+    replace_profiles as db_replace_profiles,
+    save_cycle as db_save_cycle,
+)
 
 N_STAFF, N_DAYS, N_SHIFTS = 30, 31, 2
 
 REQUEST_CHOICES = [
-    ("unavailable", "×"),
-    ("avoid", "△"),
     ("available", "○"),
+    ("avoid", "△"),
+    ("unavailable", "×"),
     ("mandatory", "勤務"),
     ("want", "勤務希望"),
     ("research", "研究日希望"),
@@ -43,12 +62,12 @@ LABEL_TO_REQUEST = {label: value for value, label in REQUEST_CHOICES}
 
 class StaffInput(BaseModel):
     no: int = 0
+    profile_id: int | None = None
+    staff_code: str = ""
     name: str = ""
     emergency_count: int = Field(0, ge=0, le=1)
     leader_level: int = Field(0, ge=0, le=2)
-    # EW1/IW1 は現行solverに接続。EW2/IW2 は管理情報として保持し、
-    # 将来solverを拡張するときにそのまま利用できるようAPIでも受け取る。
-    ew1_candidate: bool = False
+    # EW1/IW1 は現行solverに接続。EW2/IW2 は管理情報として保持する。
     ew1_available: int = Field(0, ge=0, le=1)
     ew2_available: int = Field(0, ge=0, le=1)
     ew3_available: int = Field(0, ge=0, le=1)
@@ -63,7 +82,7 @@ class ScheduleInput(BaseModel):
     staff: list[StaffInput]
     requests: list[list[list[str]]]
     coverage: list[list[dict[str, int]]]
-    night_pair_ng: list[list[int]] = []
+    night_pair_ng: list[list[str]] = []
     @field_validator("dates")
     @classmethod
     def dates_are_31(cls, value):
@@ -99,25 +118,67 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
-class Base(DeclarativeBase):
-    pass
+class OutsideWorkRuleInput(BaseModel):
+    weekday: int = Field(..., ge=0, le=6)
+    hospital_name: str = ""
 
 
-class AppState(Base):
-    __tablename__ = "app_state"
+class StaffProfileInput(BaseModel):
+    id: int | None = None
+    staff_code: str = ""
+    name: str = ""
+    emergency_count: int = Field(0, ge=0, le=1)
+    leader_level: int = Field(0, ge=0, le=2)
+    ew1_available: int = Field(0, ge=0, le=1)
+    ew2_available: int = Field(0, ge=0, le=1)
+    ew3_available: int = Field(0, ge=0, le=1)
+    iw1_available: int = Field(0, ge=0, le=3)
+    iw2_available: int = Field(0, ge=0, le=1)
+    target_day: int = Field(0, ge=0, le=20)
+    target_night: int = Field(0, ge=0, le=10)
+    active: bool = True
+    outside_work: list[OutsideWorkRuleInput] = []
 
-    key: Mapped[str] = mapped_column(String(100), primary_key=True)
-    value: Mapped[dict | list] = mapped_column(JSON, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
+
+class StaffProfilesPayload(BaseModel):
+    staff: list[StaffProfileInput]
 
 
-class StatePayload(BaseModel):
-    value: dict | list
+class CycleStatePayload(BaseModel):
+    cycleStart: str
+    dates: list[str]
+    staff: list[StaffInput]
+    requests: list[list[list[str]]]
+    remarks: list[list[list[str]]]
+    adminRequests: list[list[list[str]]] = []
+    adminRemarks: list[list[list[str]]] = []
+    coverage: list[list[dict[str, int]]] = []
+    night_pair_ng: list[list[str]] = []
+    status: str = "editing"
+    completedAt: str | None = None
+
+
+class CurrentCyclePayload(BaseModel):
+    cycle_start: str
+
+
+class RequestStaffMappingInput(BaseModel):
+    profile_ids: list[int | None]
+
+
+class NightPairNGMasterInput(BaseModel):
+    pairs: list[list[str]] = []
+
+
+class CoverageFormatInput(BaseModel):
+    weekday_day_staff: int = Field(3, ge=0, le=10)
+    weekday_night_staff: int = Field(2, ge=0, le=5)
+    weekday_day_leaders: int = Field(1, ge=0, le=3)
+    weekday_night_leaders: int = Field(1, ge=0, le=2)
+    holiday_day_staff: int = Field(3, ge=0, le=10)
+    holiday_night_staff: int = Field(2, ge=0, le=5)
+    holiday_day_leaders: int = Field(1, ge=0, le=3)
+    holiday_night_leaders: int = Field(1, ge=0, le=2)
 
 
 app = FastAPI(title="Shift Schedule API", version="3.1.0")
@@ -133,6 +194,20 @@ app.add_middleware(
 @app.on_event("startup")
 def create_database_tables():
     Base.metadata.create_all(bind=engine)
+    # regular_outside_work を勤務者ID(staff_code)参照へ移行する。
+    upgrade_relational_schema(engine)
+    # 新テーブルを反映。
+    Base.metadata.create_all(bind=engine)
+    # 設定JSONが増えても保存できるよう app_settings.value_text をTEXTへ拡張。
+    upgrade_app_settings_schema(engine)
+    # 夜勤ペアNGをslot番号から勤務者IDへ移行する。
+    migrate_night_pair_ng_to_staff_code(engine)
+    # 旧 app_state(JSON) が存在し、新しい正規化テーブルが空なら一度だけ移行する。
+    migrate_legacy_app_state(engine, SessionLocal, N_STAFF, N_DAYS)
+    # 旧 stage='admin' データを最終決定テーブルへ移行する。
+    with SessionLocal() as session:
+        migrate_legacy_final_decisions(session)
+        session.commit()
 
 
 @app.get("/")
@@ -150,27 +225,245 @@ def health():
         raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc
 
 
-@app.get("/state/{key}")
-def get_state(key: str):
+@app.get("/staff-profiles")
+def get_staff_profiles():
     with SessionLocal() as session:
-        row = session.get(AppState, key)
-        if row is None:
-            raise HTTPException(status_code=404, detail="state not found")
-        return {"key": row.key, "value": row.value, "updated_at": row.updated_at}
+        return {"staff": db_list_profiles(session)}
 
 
-@app.put("/state/{key}")
-def put_state(key: str, payload: StatePayload):
+@app.put("/staff-profiles")
+def put_staff_profiles(payload: StaffProfilesPayload):
     with SessionLocal() as session:
-        row = session.get(AppState, key)
-        if row is None:
-            row = AppState(key=key, value=payload.value)
-            session.add(row)
-        else:
-            row.value = payload.value
-            row.updated_at = datetime.now(timezone.utc)
+        try:
+            staff = db_replace_profiles(session, [x.model_dump() for x in payload.staff])
+            session.commit()
+            return {"saved": True, "staff": staff}
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+
+
+@app.delete("/staff-profiles/{profile_id}")
+def delete_staff_profile(profile_id: int):
+    with SessionLocal() as session:
+        profile = session.get(StaffProfile, profile_id)
+        deleted_staff_code = str(profile.staff_code or "") if profile else ""
+        deleted = db_delete_profile(session, profile_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="勤務者プロファイルが見つかりません。")
+
+        # 申請入力IDとの対応表に削除対象が残らないようにする。
+        raw = db_get_setting(session, "request_staff_mapping")
+        if raw:
+            try:
+                mapping = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                mapping = []
+            if isinstance(mapping, list):
+                mapping = [None if (x is not None and int(x) == profile_id) else x for x in mapping]
+                db_put_setting(session, "request_staff_mapping", json.dumps(mapping, ensure_ascii=False))
+
+        # 夜勤ペアNGマスタからも削除対象を含む組み合わせを除外する。
+        raw_pairs = db_get_setting(session, "night_pair_ng_master")
+        if raw_pairs:
+            try:
+                master_pairs = json.loads(raw_pairs)
+            except (TypeError, json.JSONDecodeError):
+                master_pairs = []
+            if isinstance(master_pairs, list):
+                master_pairs = [
+                    pair for pair in master_pairs
+                    if isinstance(pair, list) and len(pair) == 2 and deleted_staff_code not in [str(pair[0]), str(pair[1])]
+                ]
+                db_put_setting(session, "night_pair_ng_master", json.dumps(master_pairs, ensure_ascii=False))
+
         session.commit()
-        return {"saved": True, "key": key}
+        return {"deleted": True, "profile_id": profile_id}
+
+
+DEFAULT_COVERAGE_FORMAT = {
+    "weekday_day_staff": 3,
+    "weekday_night_staff": 2,
+    "weekday_day_leaders": 1,
+    "weekday_night_leaders": 1,
+    "holiday_day_staff": 3,
+    "holiday_night_staff": 2,
+    "holiday_day_leaders": 1,
+    "holiday_night_leaders": 1,
+}
+
+
+@app.get("/settings/coverage-format")
+def get_coverage_format():
+    with SessionLocal() as session:
+        raw = db_get_setting(session, "coverage_format")
+        if not raw:
+            return DEFAULT_COVERAGE_FORMAT
+        try:
+            saved = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            saved = {}
+        return {**DEFAULT_COVERAGE_FORMAT, **saved}
+
+
+@app.put("/settings/coverage-format")
+def put_coverage_format(payload: CoverageFormatInput):
+    values = payload.model_dump()
+    with SessionLocal() as session:
+        db_put_setting(session, "coverage_format", json.dumps(values, ensure_ascii=False))
+        session.commit()
+    return {"saved": True, **values}
+
+
+@app.get("/settings/request-staff-mapping")
+def get_request_staff_mapping():
+    with SessionLocal() as session:
+        raw = db_get_setting(session, "request_staff_mapping")
+        if not raw:
+            return {"profile_ids": [None] * N_STAFF}
+        try:
+            saved = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            saved = []
+        if not isinstance(saved, list):
+            saved = []
+        values = [(int(x) if x is not None else None) for x in saved[:N_STAFF]]
+        values.extend([None] * (N_STAFF - len(values)))
+        return {"profile_ids": values}
+
+
+@app.put("/settings/request-staff-mapping")
+def put_request_staff_mapping(payload: RequestStaffMappingInput):
+    values = list(payload.profile_ids[:N_STAFF])
+    values.extend([None] * (N_STAFF - len(values)))
+    with SessionLocal() as session:
+        db_put_setting(session, "request_staff_mapping", json.dumps(values, ensure_ascii=False))
+        session.commit()
+    return {"saved": True, "profile_ids": values}
+
+
+@app.get("/settings/night-pair-ng-master")
+def get_night_pair_ng_master():
+    with SessionLocal() as session:
+        raw = db_get_setting(session, "night_pair_ng_master")
+        if not raw:
+            return {"pairs": []}
+        try:
+            saved = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            saved = []
+        if not isinstance(saved, list):
+            saved = []
+        pairs = []
+        seen = set()
+        for pair in saved:
+            if not isinstance(pair, list) or len(pair) != 2:
+                continue
+            converted = []
+            for value in pair:
+                code = str(value or "").strip()
+                # 旧版は staff_profiles.id を保存していたため、数字だけなら勤務者IDへ変換する。
+                if code.isdigit():
+                    profile = session.get(StaffProfile, int(code))
+                    code = str(profile.staff_code or "").strip() if profile else ""
+                converted.append(code)
+            a, b = converted
+            if not a or not b or a == b:
+                continue
+            key = tuple(sorted((a, b)))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append([a, b])
+        return {"pairs": pairs}
+
+
+@app.put("/settings/night-pair-ng-master")
+def put_night_pair_ng_master(payload: NightPairNGMasterInput):
+    pairs = []
+    seen = set()
+    for pair in payload.pairs:
+        if len(pair) != 2:
+            continue
+        a, b = str(pair[0] or "").strip(), str(pair[1] or "").strip()
+        if not a or not b or a == b:
+            continue
+        key = tuple(sorted((a, b)))
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append([a, b])
+    with SessionLocal() as session:
+        db_put_setting(session, "night_pair_ng_master", json.dumps(pairs, ensure_ascii=False))
+        session.commit()
+    return {"saved": True, "pairs": pairs}
+
+
+@app.get("/cycles/statuses")
+def get_cycle_statuses():
+    with SessionLocal() as session:
+        return {"statuses": db_cycle_statuses(session)}
+
+
+@app.get("/cycles/current")
+def get_current_cycle():
+    with SessionLocal() as session:
+        return {"cycle_start": db_get_setting(session, "current_cycle")}
+
+
+@app.put("/cycles/current")
+def put_current_cycle(payload: CurrentCyclePayload):
+    with SessionLocal() as session:
+        db_put_setting(session, "current_cycle", payload.cycle_start)
+        session.commit()
+        return {"saved": True, "cycle_start": payload.cycle_start}
+
+
+@app.get("/cycles/{cycle_start}")
+def get_cycle(cycle_start: str):
+    try:
+        date.fromisoformat(cycle_start)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="cycle_start は YYYY-MM-DD 形式で指定してください。") from exc
+    with SessionLocal() as session:
+        data = db_load_cycle(session, cycle_start, N_STAFF, N_DAYS)
+        if data is None:
+            raise HTTPException(status_code=404, detail="cycle not found")
+        return data
+
+
+@app.put("/cycles/{cycle_start}")
+def put_cycle(cycle_start: str, payload: CycleStatePayload):
+    if payload.cycleStart != cycle_start:
+        raise HTTPException(status_code=422, detail="URLのクール開始日とpayload.cycleStartが一致しません。")
+    with SessionLocal() as session:
+        try:
+            data = db_save_cycle(session, cycle_start, payload.model_dump(), N_STAFF, N_DAYS)
+            db_put_setting(session, "current_cycle", cycle_start)
+            session.commit()
+            return {"saved": True, "cycle": data}
+        except (ValueError, TypeError) as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail=f"クールデータを保存できません: {exc}") from exc
+
+
+@app.delete("/cycles/{cycle_start}")
+def delete_cycle(cycle_start: str):
+    try:
+        date.fromisoformat(cycle_start)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="cycle_start は YYYY-MM-DD 形式で指定してください。") from exc
+    with SessionLocal() as session:
+        try:
+            deleted = db_delete_cycle(session, cycle_start)
+            session.commit()
+            return {"deleted": deleted, "cycle_start": cycle_start}
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
 
 def arrays_from_payload(payload):
     unavailable = np.ones((N_STAFF, N_DAYS, N_SHIFTS), dtype=bool)
@@ -183,7 +476,7 @@ def arrays_from_payload(payload):
     for s, member in enumerate(payload.staff):
         staffno[s] = member.no or s + 1; staffname[s] = member.name.strip()
         leader[s] = member.leader_level
-        ew1_candidate[s] = bool(member.ew1_available or member.ew1_candidate)
+        ew1_candidate[s] = bool(member.ew1_available)
         # IW1の0〜3をそのままsolver内部の優先度配列へ渡す。
         iw1_priority[s] = int(member.iw1_available)
         optimal[s] = [member.target_day, member.target_night]
@@ -192,8 +485,14 @@ def arrays_from_payload(payload):
             for d in range(min(N_DAYS, len(payload.requests[s]))):
                 for sh in range(N_SHIFTS):
                     state = payload.requests[s][d][sh]
-                    unavailable[s,d,sh] = state == "unavailable"
-                    avoid[s,d,sh] = state == "avoid"; mandatory[s,d,sh] = state == "mandatory"
+                    unavailable[s,d,sh] = state in ("unavailable", "regular_outside")
+                    avoid[s,d,sh] = state == "avoid"
+                    mandatory[s,d,sh] = state == "mandatory"
+                    # 勤務申請／最終決定で EW1・IW1 が指定された場合は、
+                    # solver の専用 mandatory 配列へ明示的に渡す。
+                    # これがないと画面上で EW1/IW1 を選択しても固定勤務にならない。
+                    ew1_mandatory[s,d,sh] = state == "ew1"
+                    iw1_mandatory[s,d,sh] = state == "iw1"
     min_work = np.zeros((N_DAYS,N_SHIFTS),dtype=int); min_leader=np.zeros_like(min_work)
     ew1_count=np.zeros_like(min_work); iw1_count=np.zeros_like(min_work)
     for d, shifts in enumerate(payload.coverage[:N_DAYS]):
@@ -301,7 +600,6 @@ def _request_excel_workbook(payload: RequestExcelInput):
         ws.cell(request_row, 2, parsed)
         ws.cell(request_row, 3, weekdays[parsed.weekday()])
         ws.cell(request_row, 4, holiday_label)
-        ws.cell(remark_row, 4, "備考")
         ws.cell(request_row, 2).number_format = "yyyy/mm/dd"
 
         base_fill = holiday_fill if holiday_label == "休日" else PatternFill(fill_type=None)
@@ -332,6 +630,17 @@ def _request_excel_workbook(payload: RequestExcelInput):
                 ws.cell(remark_row, col).fill = remark_fill
                 ws.cell(remark_row, col).alignment = Alignment(horizontal="left", vertical="center")
                 dropdown.add(ws.cell(request_row, col))
+
+        # A～D列は、勤務希望行と備考行を1つのセルとして縦結合する。
+        # 例: A4:A5, B4:B5, C4:C5, D4:D5 ... A64:A65～D64:D65
+        for col in range(1, 5):
+            ws.merge_cells(
+                start_row=request_row,
+                start_column=col,
+                end_row=remark_row,
+                end_column=col,
+            )
+            ws.cell(request_row, col).alignment = Alignment(horizontal="center", vertical="center")
 
     # --------------------------------------------------
     # BM列以降：日別の管理者設定
@@ -658,16 +967,17 @@ def _parse_request_excel(content: bytes):
             raise HTTPException(400, f"{ws.cell(68, col).coordinate} の適切なシフト数（日勤）は0〜20で選択してください。")
         if not 0 <= target_night <= 10:
             raise HTTPException(400, f"{ws.cell(68, col + 1).coordinate} の適切なシフト数（夜勤）は0〜10で選択してください。")
-        for row, value in ((69, ew1_available), (70, ew2_available), (71, ew3_available), (72, iw1_available), (73, iw2_available)):
+        for row, value in ((69, ew1_available), (70, ew2_available), (71, ew3_available), (73, iw2_available)):
             if value not in (0, 1):
                 raise HTTPException(400, f"{ws.cell(row, col).coordinate} は0または1で入力してください。")
+        if iw1_available not in (0, 1, 2, 3):
+            raise HTTPException(400, f"{ws.cell(72, col).coordinate} のIW1は0〜3で入力してください。")
 
         staff.append({
             "no": i,
             "name": staff_names[i],
             "emergency_count": emergency_count,
             "leader_level": leader_level,
-            "ew1_candidate": bool(ew1_available),
             "ew1_available": int(ew1_available),
             "ew2_available": int(ew2_available),
             "ew3_available": int(ew3_available),
@@ -701,14 +1011,35 @@ def export_requests_excel(payload: RequestExcelInput = Body(...)):
 
 
 @app.post("/requests/import")
-async def import_requests_excel(file: UploadFile = File(...)):
+async def import_requests_excel(
+    file: UploadFile = File(...),
+    cycle_start: str = Form(...),
+):
     if Path(file.filename or "").suffix.lower() not in {".xlsx", ".xlsm"}:
         raise HTTPException(400, ".xlsx または .xlsm ファイルを選択してください。")
     try:
+        try:
+            cycle_date = date.fromisoformat(cycle_start)
+        except ValueError as exc:
+            raise HTTPException(400, "現在のクール開始日が正しくありません。") from exc
+
         content = await file.read()
         if not content:
             raise HTTPException(400, "ファイルが空です。")
-        return _parse_request_excel(content)
+        payload = _parse_request_excel(content)
+
+        # Excelは申請開始日の前2日から後1日まで31日間。
+        expected_first = cycle_date - timedelta(days=2)
+        expected_dates = [(expected_first + timedelta(days=i)).isoformat() for i in range(N_DAYS)]
+        if payload.get("dates") != expected_dates:
+            actual = payload.get("dates") or []
+            actual_first = actual[0] if actual else "不明"
+            actual_last = actual[-1] if actual else "不明"
+            raise HTTPException(
+                400,
+                f"Excelの日付が現在のクールと一致しません。現在: {expected_dates[0]} ～ {expected_dates[-1]} / Excel: {actual_first} ～ {actual_last}",
+            )
+        return payload
     finally:
         await file.close()
 

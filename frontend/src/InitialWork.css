@@ -86,3 +86,32 @@
   font-weight: 700;
   color: #7a4b00;
 }
+
+/* ===== 2026-09-06 application coverage fixed cell width =====
+   勤務申請 > 日別の必要人数:
+   ブラウザ幅に応じて列幅が伸縮しないよう、入力セルを76ptに固定する。
+   2列を束ねるグループ見出しは 76pt x 2 = 152pt。 */
+.application-coverage-fixed{
+  width:max-content;
+  min-width:max-content;
+  table-layout:fixed;
+}
+.application-coverage-fixed .coverage-group{
+  width:100pt;
+  min-width:100pt;
+  max-width:100pt;
+  box-sizing:border-box;
+}
+.application-coverage-fixed .coverage-head,
+.application-coverage-fixed tbody td{
+  width:50pt;
+  min-width:50pt;
+  max-width:50pt;
+  box-sizing:border-box;
+}
+.application-coverage-fixed tbody td select{
+  width:48px;
+  max-width:calc(100% - 8px);
+  box-sizing:border-box;
+}
+

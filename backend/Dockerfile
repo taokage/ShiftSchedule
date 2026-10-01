@@ -7,6 +7,8 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app.py ./app.py
+COPY backend/database.py ./database.py
+
 COPY shift_schedule_loader.py shift_schedule_solver.py shift_schedule_constraints.py shift_schedule_objective.py shift_schedule_exporter.py ./
 
 EXPOSE 8000

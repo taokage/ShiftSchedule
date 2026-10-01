@@ -80,6 +80,10 @@ docker compose down -v
 現在は以下をPostgreSQLの `app_state` テーブルにJSONとして保存します。
 
 - `shift-admin-staff-v2`: 管理者画面の勤務者情報、目標勤務数、EW/IW可否
-- `shift-draft`: クール、勤務申請、備考、必要人数、管理者調整内容などの画面状態
+- `shift-draft`: クール、勤務申請、備考、必要人数、勤務者プロファイル内容などの画面状態
 
 frontendは直接DBへ接続せず、必ずFastAPI経由で読み書きします。
+
+## PostgreSQL data persistence
+
+Docker Compose uses the fixed Docker volume name `shiftschedule_shift_schedule_db_data` so database data is reused even when the project is extracted into a different directory. Do not run `docker compose down -v` unless you intentionally want to delete the database.

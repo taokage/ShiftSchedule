@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: shift_schedule
       POSTGRES_USER: shift_user
       POSTGRES_PASSWORD: shift_password
+    ports:
+      - "5432:5432"
     volumes:
       - shift_schedule_db_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -46,3 +48,4 @@ services:
 
 volumes:
   shift_schedule_db_data:
+    name: shiftschedule_shift_schedule_db_data
