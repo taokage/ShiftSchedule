@@ -154,9 +154,9 @@ def set_objective(
     # 目的3：本務の同日・日勤夜勤両方を避ける
     # ただし、勤務不可・回避希望が多い人はペナルティを軽くする
 
-    BASE_DAY_NIGHT_SAME_DAY_PENALTY = 7200
+    BASE_DAY_NIGHT_SAME_DAY_PENALTY = 15000
     REQUEST_DISCOUNT_PER_COUNT = 120
-    MIN_DAY_NIGHT_SAME_DAY_PENALTY = 1200
+    MIN_DAY_NIGHT_SAME_DAY_PENALTY = 3000
 
     for staff in range(NUM_STAFF):
 
@@ -193,7 +193,7 @@ def set_objective(
             )
 
     # 目的4：本務NightShift翌日の本務勤務を避ける
-    POST_NIGHT_OFF_PENALTY = 10000
+    POST_NIGHT_OFF_PENALTY = 30000
 
     for staff in range(NUM_STAFF):
         for day in range(1, NUM_DAYS - 1):
